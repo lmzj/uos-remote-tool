@@ -23,10 +23,11 @@
 
 ### 直接用（Windows）
 
-下载 `UOSRemoteTool.exe`，双击运行。
+到 [Releases](https://github.com/lmzj/uos-remote-tool/releases) 下载 `UOSRemoteTool.exe`（约 19 MB），双击运行。
 
 - 会弹出一个原生窗口（内嵌 Web 界面），**关掉窗口即停止服务**
 - 界面实际访问 `http://127.0.0.1:8765`，仅监听本机，外部不可访问
+- 需要旧版本 / 历史构建可在 [Releases 列表](https://github.com/lmzj/uos-remote-tool/releases) 里找
 
 ### 从源码运行
 
