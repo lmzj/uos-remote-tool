@@ -1,0 +1,21 @@
+# 连接配置（含明文密码，切勿提交）
+connections.json
+connections*.json
+
+# 上传暂存
+_uploads/
+
+# PyInstaller 构建中间产物
+build/
+dist/
+*.spec.bak
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 系统
+.DS_Store
+Thumbs.db
