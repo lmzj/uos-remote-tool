@@ -4,9 +4,13 @@
 
 典型场景：管理信创终端（UOS、Deepin、麒麟等），远程装软件、查硬件、修输入法，不用跑到工位前。
 
-**当前版本：v1.0.1**
+**当前版本：v1.1.0**
 
-> 可执行文件统一发布在 [Releases](https://github.com/lmzj/uos-remote-tool/releases) 页面，仓库本身不存放 exe。
+## 更新日志
+
+- **v1.1.0** — 新增「升级修复」模块：诊断 / 一键修复 UOS 控制中心升级按钮失效（lastore 源配置缺失），带安全阀
+- **v1.0.1** — 连接支持编辑（改 IP / 密码 / 提权方式后原地保存，改完自动重置提权检测结果）；修复删除当前连接后选中态错乱
+- **v1.0.0** — 首个正式版：连接管理、系统信息、软件管理、上传安装、加入 sudoers、输入法；去掉启动黑窗
 
 ---
 
@@ -20,6 +24,7 @@
 | **上传安装** | 本地选 `.deb` 等包 → SFTP 传到远程 → `dpkg -i` 安装，带进度条 |
 | **加入 sudoers** | 一键把登录账号加入 `sudo` 组，之后可用登录密码提权 |
 | **输入法** | 远程把搜狗拼音写进 fcitx 启用列表并重载，自动探测真实输入法 ID |
+| **升级修复** | 诊断并修复「系统升级按钮失效」：补齐 lastore 源配置、修 `config.json`、重启 lastore。**只改配置，不跑 apt upgrade** |
 
 ---
 
@@ -32,7 +37,6 @@
 - 会弹出一个原生窗口（内嵌 Web 界面），**关掉窗口即停止服务**
 - 界面实际访问 `http://127.0.0.1:8765`，仅监听本机，外部不可访问
 - 历史版本可在 [Releases 列表](https://github.com/lmzj/uos-remote-tool/releases) 里找
-- GUI 模式下控制台输出会写入程序同目录的 `uostool.log`，排错时看它
 
 ### 从源码运行
 
@@ -117,6 +121,23 @@ UOS 的 `su` / `sudo` 会在正常输出前插入「验证成功」等提示行�
 **6. faillock 锁定**
 SSH 连续失败会触发账户锁定，需在目标机执行 `faillock --user <用户名> --reset` 解锁。
 
+**7. lastore 用的是自己的源目录**
+UOS 升级由 `lastore-daemon` 驱动，它读 `/var/lib/lastore/` 而**不是** `/etc/apt`。该目录下源配置缺失时，
+`lastore` 认为没有可更新内容 → 控制中心升级按钮失效。`apt` 层面完全正常，所以很容易误判。
+
+**8. `UpdatablePackages` 不是一个可靠的值**
+lastore 5.6.x 上：`busctl` 取该属性报 `Input/output error`，`dbus-send ... Properties.Get` 报
+`PropertyNotFound`，`GetAll` 的返回里也**没有**这一项（introspection 里却有）。
+本工具改为三级回退：D-Bus → 解析 `update_infos.json` 里 `"Package"` 条目数 → 标记「读不到」。
+
+**9. 修复前务必先诊断**
+「升级修复」内置安全阀：诊断显示 lastore 正常（可升级包数 > 0）时**不修改任何配置**，
+避免把好机器改坏。确需重建源配置时，勾选「忽略诊断结果，强制执行修复」。
+
+**10. 源地址必须取自本机**
+生成 `/var/lib/lastore/sources.list` 时从该机 `/etc/apt/sources.list` 提取 `deb` 行，
+**绝不照抄其它机器**——专业版源、内网镜像、社区版源各不相同。
+
 ---
 
 ## 文件结构
@@ -125,26 +146,8 @@ SSH 连续失败会触发账户锁定，需在目标机执行 `faillock --user <
 uos_remote_tool.py      # 主程序（后端 + 内嵌前端页面，单文件）
 UOSRemoteTool.spec      # PyInstaller 打包配置
 connections.json        # 连接配置（明文，运行后生成，已 gitignore）
-uostool.log             # GUI 模式运行日志（已 gitignore）
 _uploads/               # 上传文件暂存目录
 ```
-
----
-
-## 更新日志
-
-### v1.0.1
-
-- 连接列表新增「✎ 编辑」入口，已保存的连接可直接修改（老配置缺字段时自动兜底）
-- 界面标题显示当前版本号
-- 保存连接后重置提权状态，提示重新「检测提权」，避免沿用失效结果
-- 删除正在选中的连接时同步取消选中
-- 连接名过长时正常换行，不再挤掉操作按钮
-- GUI（无控制台）模式下把 stdout / stderr 重定向到 `uostool.log`，便于排查启动崩溃
-
-### v1.0.0
-
-- 首个可用版本：连接管理、系统信息、软件管理、上传安装、加入 sudoers、输入法修复
 
 ---
 

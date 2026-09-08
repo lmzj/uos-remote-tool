@@ -10,7 +10,7 @@ UOS 远程助手 —— 远程 Debian/UOS 主机管理工具
   * 本地 Web 界面, 仅监听 127.0.0.1
 """
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 
 import os
 import sys
@@ -790,6 +790,357 @@ def action_addime(tid, cfg, set_default=True):
         task_done(tid, {"ok": False, "error": str(e)}, status="error")
 
 
+# --------------------------------------------------------------------------
+# 系统升级故障修复（UOS / Deepin 的 lastore 升级守护进程）
+# --------------------------------------------------------------------------
+UPG_CONFIG = "/var/lib/lastore/config.json"
+
+# 诊断脚本：只读，不改任何东西
+UPG_DIAG_SCRIPT = r'''
+printf 'READOK=%s\n' "$([ -r /var/lib/lastore ] && echo yes || echo no)"
+printf 'OS=%s\n' "$(grep -E '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d '"')"
+printf 'ACTIVE=%s\n' "$(systemctl is-active lastore-daemon 2>/dev/null)"
+printf 'SLD=%s\n' "$(ls -1 /var/lib/lastore/sources.list.d/ 2>/dev/null | wc -l | tr -d ' ')"
+printf 'SL=%s\n' "$([ -s /var/lib/lastore/sources.list ] && echo yes || echo no)"
+printf 'LISTS=%s\n' "$(ls -1 /var/lib/lastore/lists/ 2>/dev/null | wc -l | tr -d ' ')"
+v=""
+if command -v busctl >/dev/null 2>&1; then
+  v=$(busctl --system get-property com.deepin.lastore /com/deepin/lastore com.deepin.lastore.Manager UpdatablePackages 2>/dev/null | awk '{print $NF}')
+fi
+if [ -z "$v" ] && command -v dbus-send >/dev/null 2>&1; then
+  v=$(dbus-send --system --print-reply --dest=com.deepin.lastore /com/deepin/lastore org.freedesktop.DBus.Properties.Get string:com.deepin.lastore.Manager string:UpdatablePackages 2>/dev/null | grep -o 'uint32 [0-9]*' | awk '{print $2}')
+fi
+printf 'PKG_DBUS=%s\n' "$v"
+printf 'PKG_UI=%s\n' "$(grep -o '"Package"' /var/lib/lastore/update_infos.json 2>/dev/null | wc -l | tr -d ' ')"
+printf 'UI=%s\n' "$(head -c 20 /var/lib/lastore/update_infos.json 2>/dev/null | tr -d '\n')"
+printf 'APT=%s\n' "$(apt-get -s upgrade 2>/dev/null | grep -c '^Inst ')"
+'''
+
+# 修复脚本：需要 root
+UPG_FIX_SCRIPT = r'''
+mkdir -p /var/lib/lastore/sources.list.d /var/lib/lastore/lists
+for f in /etc/apt/sources.list.d/*.list; do
+  [ -e "$f" ] && ln -sf "$f" /var/lib/lastore/sources.list.d/${f##*/}
+done
+printf 'SLD_NOW=%s\n' "$(ls -1 /var/lib/lastore/sources.list.d/ 2>/dev/null | wc -l | tr -d ' ')"
+if grep -q '^deb' /etc/apt/sources.list 2>/dev/null; then
+  grep '^deb' /etc/apt/sources.list > /var/lib/lastore/sources.list
+  printf 'SL_SRC=system\n'
+elif ls /etc/apt/sources.list.d/*.list >/dev/null 2>&1 && grep -hs '^deb' /etc/apt/sources.list.d/*.list 2>/dev/null | grep -q .; then
+  grep -hs '^deb' /etc/apt/sources.list.d/*.list > /var/lib/lastore/sources.list 2>/dev/null
+  printf 'SL_SRC=system.d\n'
+else
+  printf 'deb [by-hash=force] https://professional-packages.chinauos.com/desktop-professional eagle main contrib non-free\n' > /var/lib/lastore/sources.list
+  printf 'SL_SRC=default\n'
+fi
+chmod 644 /var/lib/lastore/sources.list 2>/dev/null || true
+printf 'SL_LINES=%s\n' "$(grep -c '^deb' /var/lib/lastore/sources.list 2>/dev/null | tr -d ' ')"
+systemctl restart lastore-daemon 2>&1 | tail -2 || true
+sleep 3
+printf 'ACTIVE=%s\n' "$(systemctl is-active lastore-daemon 2>/dev/null)"
+dbus-send --system --print-reply --dest=com.deepin.lastore /com/deepin/lastore com.deepin.lastore.Manager.UpdateSource 2>&1 | tail -3 || true
+printf 'TRIGGERED=yes\n'
+'''
+
+
+def upg_parse(text):
+    d = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if "=" in line:
+            k, v = line.split("=", 1)
+            d[k.strip()] = v.strip()
+    return d
+
+
+def upg_read_text(h, path, root=False):
+    """读远程文本文件，普通用户读不到时可选提权再读。"""
+    raw = h.get_bytes(path)
+    if raw is not None:
+        return raw.decode("utf-8", "replace")
+    if root:
+        c, out, _ = h.exec_root("cat %s" % shell_quote(path), 30)
+        if c == 0 and (out or "").strip():
+            return out
+    return None
+
+
+def upg_diag(h, log=None):
+    code, out, err = h.exec_cmd(UPG_DIAG_SCRIPT, 180)
+    d = upg_parse(out)
+    if d.get("READOK") != "yes":
+        if log:
+            log("  普通用户读不到 /var/lib/lastore，改用提权方式复查 …")
+        c2, out2, _ = h.exec_root(UPG_DIAG_SCRIPT, 180)
+        for k, v in upg_parse(out2).items():
+            if v not in (None, ""):
+                d[k] = v
+    return d
+
+
+def upg_mode(text):
+    try:
+        j = json.loads(text)
+        return j.get("UpdateMode")
+    except Exception:
+        return None
+
+
+def upg_pkg(d):
+    """取 lastore 认为可升级的包数，返回 (数量, 来源)。
+    优先 D-Bus；部分 lastore 版本（如 5.6.x）的 UpdatablePackages 取不到值，
+    回退到 update_infos.json 里 Package 条目的数量。"""
+    v = (d.get("PKG_DBUS") or "").strip()
+    if v.isdigit():
+        return int(v), "D-Bus"
+    v2 = (d.get("PKG_UI") or "").strip()
+    if v2.isdigit():
+        return int(v2), "update_infos.json"
+    return -1, ""
+
+
+def upg_verdict(pkg, d, mode):
+    """healthy=正常 / fault=确为源配置缺失 / unknown=待观察"""
+    try:
+        sld = int((d.get("SLD") or "0").strip() or 0)
+    except Exception:
+        sld = -1
+    if pkg > 0:
+        return "healthy"
+    if pkg == 0 and (sld == 0 or d.get("SL") != "yes" or mode in (0, "0")):
+        return "fault"
+    return "unknown"
+
+
+def upg_fix_config(h, log):
+    """修复 /var/lib/lastore/config.json 的更新模式，返回 (旧值, 新值)。"""
+    text = upg_read_text(h, UPG_CONFIG, root=True)
+    if not text or not text.strip():
+        log("  未读到 config.json，跳过更新模式修复")
+        return None, None
+    try:
+        d = json.loads(text)
+    except Exception as e:
+        log("  config.json 解析失败，跳过修改: %s" % e)
+        return None, None
+    if not isinstance(d, dict):
+        log("  config.json 结构异常，跳过修改")
+        return None, None
+
+    keys = ("UpdateMode", "AutoCheckUpdates", "UpdateNotify", "AutoDownloadUpdates")
+    old = dict((k, d.get(k)) for k in keys)
+    d["UpdateMode"] = 7                 # 7 = 系统+应用+安全更新全开
+    d["AutoCheckUpdates"] = True
+    d["UpdateNotify"] = True
+    d["AutoDownloadUpdates"] = False    # 保守：不后台自动下载（实测可能 2GB+）
+
+    if all(d[k] == old[k] for k in keys):
+        log("  UpdateMode 已是 7 且各项正常，配置无需修改")
+        return old.get("UpdateMode"), d["UpdateMode"]
+
+    ts = time.strftime("%Y%m%d%H%M%S")
+    h.exec_root("cp -a %s %s.bak.%s" % (UPG_CONFIG, UPG_CONFIG, ts), 30)
+    log("  已备份 → %s.bak.%s" % (UPG_CONFIG, ts))
+    tmp = "/tmp/.uostool_lastore_cfg.json"
+    h.put_bytes(tmp, json.dumps(d, ensure_ascii=False, indent=2).encode("utf-8"))
+    c, out, err = h.exec_root(
+        "cat %s > %s && chmod 644 %s && rm -f %s" % (tmp, UPG_CONFIG, UPG_CONFIG, tmp), 30)
+    if c != 0:
+        log("  写入 config.json 失败: %s" % ((err or out or "").strip()[:200]))
+        return old.get("UpdateMode"), None
+    log("  config.json 已修复: UpdateMode %s → 7，AutoDownloadUpdates=False"
+        % old.get("UpdateMode"))
+    return old.get("UpdateMode"), d["UpdateMode"]
+
+
+def _fmt_active(v):
+    return {"active": "运行中", "inactive": "未运行", "failed": "启动失败",
+            "activating": "启动中", "reloading": "重载中"}.get(v, v or "未知")
+
+
+def _fmt_yes(v):
+    if v == "yes":
+        return "存在"
+    if v == "no":
+        return "缺失"
+    return v or "未知"
+
+
+def upg_rows(pre, post, pre_mode, post_mode):
+    def g(d, k):
+        v = (d or {}).get(k, "")
+        return v if v != "" else "-"
+
+    def pkg(d):
+        n, src = upg_pkg(d)
+        if n < 0:
+            return "读不到"
+        return str(n) + ("（%s）" % src if src else "")
+
+    def ui(d):
+        v = g(d, "UI")
+        if v == "-":
+            return "无"
+        return "null（异常）" if v.strip() in ("null", "") else "有内容"
+
+    return [
+        ["lastore 服务状态", _fmt_active(g(pre, "ACTIVE")), _fmt_active(g(post, "ACTIVE"))],
+        ["源目录 sources.list.d 文件数", g(pre, "SLD"), g(post, "SLD")],
+        ["主源 sources.list", _fmt_yes(g(pre, "SL")), _fmt_yes(g(post, "SL"))],
+        ["包列表缓存 lists/ 文件数", g(pre, "LISTS"), g(post, "LISTS")],
+        ["apt 可升级包数（参考）", g(pre, "APT"), g(post, "APT")],
+        ["lastore 可升级包数（关键）", pkg(pre), pkg(post)],
+        ["update_infos.json", ui(pre), ui(post)],
+        ["config.json UpdateMode",
+         "-" if pre_mode is None else str(pre_mode),
+         "-" if post_mode is None else str(post_mode)],
+    ]
+
+
+VERDICT_TEXT = {
+    "healthy": "未发现升级故障：lastore 已能读到可升级包（UpdatablePackages > 0）。"
+               "若控制中心仍异常，建议注销重登或检查网络/授权。",
+    "fault": "确认为 lastore 源配置缺失型故障（apt 有包，但 lastore 认为 0 个），可一键修复。",
+    "unknown": "未能确定：lastore 暂未报告可升级包，但源配置看起来存在。"
+               "可能是刚重启还在拉列表，稍等几分钟再诊断一次。",
+}
+
+
+def action_fixupgrade(tid, cfg, do_fix=True, force=False):
+    """诊断 / 修复 UOS 控制中心升级按钮失效（lastore 源配置缺失）。"""
+    h = Host(cfg, log=lambda m: task_log(tid, m))
+    try:
+        task_log(tid, "连接 %s@%s ..." % (cfg.get("username"), cfg.get("host")))
+        h.connect()
+        task_log(tid, "SSH 登录成功")
+
+        # ---------- 1. 诊断 ----------
+        task_log(tid, "【1/4】诊断 lastore 状态（只读，约需 10~60 秒）…")
+        pre = upg_diag(h, log=lambda m: task_log(tid, m))
+        pre_cfg = upg_read_text(h, UPG_CONFIG)
+        pre_mode = upg_mode(pre_cfg)
+        pkg_pre, pkg_src = upg_pkg(pre)
+        task_log(tid, "  系统: %s" % (pre.get("OS") or "未知"))
+        task_log(tid, "  lastore 服务: %s" % _fmt_active(pre.get("ACTIVE")))
+        task_log(tid, "  源目录文件数=%s，主源=%s，包列表缓存=%s 个文件" %
+                 (pre.get("SLD", "-"), _fmt_yes(pre.get("SL")), pre.get("LISTS", "-")))
+        task_log(tid, "  可升级包数: apt=%s，lastore=%s%s" %
+                 (pre.get("APT", "-"),
+                  "读不到" if pkg_pre < 0 else pkg_pre,
+                  ("（来源 %s）" % pkg_src) if pkg_src else ""))
+        task_log(tid, "  config.json UpdateMode = %s" %
+                 ("未知" if pre_mode is None else pre_mode))
+
+        verdict_pre = upg_verdict(pkg_pre, pre, pre_mode)
+        task_log(tid, "  诊断结论: %s" % VERDICT_TEXT.get(verdict_pre, ""))
+
+        if not do_fix:
+            h.close()
+            task_done(tid, {
+                "ok": verdict_pre == "healthy",
+                "diagnosed": True,
+                "verdict": verdict_pre,
+                "rows": upg_rows(pre, {}, pre_mode, None),
+                "msg": VERDICT_TEXT.get(verdict_pre, "") +
+                      ("\n（lastore 可升级包数：%s）" % pkg_pre),
+            })
+            return
+
+        # ---------- 前置检查 ----------
+        if not pre.get("READOK") and not pre.get("ACTIVE"):
+            task_done(tid, {
+                "ok": False,
+                "error": "这台机器上没有检测到 /var/lib/lastore 或 lastore-daemon，"
+                         "可能不是 UOS / Deepin 系统，已放弃修复。\n"
+                         "（如需强制处理，请先在机器上确认 lastore 是否安装）"},
+                      status="error")
+            return
+
+        # ---------- 安全阀：诊断正常就不动它 ----------
+        if verdict_pre == "healthy" and not force:
+            h.close()
+            task_log(tid, "诊断显示 lastore 正常（%s 个可升级包），未做任何修改。" % pkg_pre)
+            task_done(tid, {
+                "ok": True,
+                "skipped": True,
+                "diagnosed": True,
+                "verdict": "healthy",
+                "rows": upg_rows(pre, {}, pre_mode, None),
+                "msg": "✅ 未发现故障：lastore 已能读到 %s 个可升级包，升级链路正常，"
+                       "因此没有修改任何配置。\n"
+                       "若控制中心仍异常，多半是界面/授权问题，建议先注销重登；\n"
+                       "确需强行重建源配置，请勾选「忽略诊断结果，强制执行修复」再试。" % pkg_pre,
+            })
+            return
+
+        # ---------- 2. 修 config.json ----------
+        task_log(tid, "【2/4】修复 config.json 更新模式 …")
+        old_mode, new_mode = upg_fix_config(h, lambda m: task_log(tid, m))
+
+        # ---------- 3. 补源配置 + 重启 ----------
+        task_log(tid, "【3/4】补齐 lastore 源配置并重启 lastore（需要 root）…")
+        c, out, err = h.exec_root(UPG_FIX_SCRIPT, 300)
+        fx = upg_parse(out)
+        if c != 0 and not fx.get("SLD_NOW"):
+            h.close()
+            task_done(tid, {
+                "ok": False,
+                "error": "修复脚本执行失败，很可能是因为提权失败。\n"
+                         "请在「编辑连接」里填写 root 密码，并把提权方式设为「su 切换到 root」，然后重试。\n"
+                         "详细信息见下方执行日志。\n\n" + ((err or out or "").strip()[:400])},
+                      status="error")
+            return
+        task_log(tid, "  源目录现有 %s 个文件；主源来源=%s，有效 deb 行=%s" %
+                 (fx.get("SLD_NOW", "-"), {"system": "系统 sources.list",
+                                           "system.d": "系统 sources.list.d",
+                                           "default": "UOS 专业版默认源"}.get(
+                                               fx.get("SL_SRC"), "-"),
+                  fx.get("SL_LINES", "-")))
+        task_log(tid, "  lastore 重启后状态: %s" % _fmt_active(fx.get("ACTIVE")))
+
+        # ---------- 4. 等待并复核 ----------
+        task_log(tid, "【4/4】等待 lastore 重新拉取更新列表（约 25 秒）…")
+        time.sleep(25)
+        post = upg_diag(h)
+        post_cfg = upg_read_text(h, UPG_CONFIG)
+        post_mode = upg_mode(post_cfg)
+        pkg_post, _ = upg_pkg(post)
+        verdict_post = upg_verdict(pkg_post, post, post_mode)
+        task_log(tid, "  复核: 可升级包数 apt=%s，lastore=%s，UpdateMode=%s" %
+                 (post.get("APT", "-"), "读不到" if pkg_post < 0 else pkg_post,
+                  "未知" if post_mode is None else post_mode))
+        h.close()
+
+        msg = []
+        msg.append("修复脚本已执行完成。")
+        if verdict_post == "healthy":
+            msg.append("✅ lastore 已能读到可升级包（%s 个），链路已恢复。" % pkg_post)
+        elif verdict_post == "fault":
+            msg.append("⚠️ lastore 仍报告 0 个可升级包。请检查："
+                       "① 机器能否访问软件源（网络/内网镜像）；"
+                       "② 系统时间是否准确（证书过期会导致 https 源失败）；"
+                       "③ 稍等几分钟后点「仅诊断」复查。")
+        else:
+            msg.append("⏳ lastore 正在重新拉取更新列表，通常需要几分钟。"
+                       "请稍后点「仅诊断」复查，可升级包数变为非 0 即说明恢复。")
+        msg.append("本操作只改了 lastore 配置，未执行任何 apt upgrade / 未动软件包。")
+        msg.append("config.json 修改前已自动备份为 .bak.时间戳。")
+        msg.append("最后请到控制中心点一次【更新】，或注销重登图形界面。")
+
+        task_done(tid, {
+            "ok": verdict_post in ("healthy", "unknown"),
+            "diagnosed": False,
+            "verdict": verdict_post,
+            "pre_verdict": verdict_pre,
+            "rows": upg_rows(pre, post, pre_mode, post_mode),
+            "old_mode": old_mode, "new_mode": new_mode,
+            "msg": "\n".join(msg),
+        })
+    except Exception as e:
+        task_log(tid, "升级修复出错: %s" % e)
+        task_done(tid, {"ok": False, "error": str(e)}, status="error")
+
+
 def action_sysinfo(tid, cfg):
     h = Host(cfg, log=lambda m: task_log(tid, m))
     try:
@@ -1022,6 +1373,7 @@ tr:hover td{background:#fafbfc}
     <div class="navitem" data-tab="install">上传安装</div>
     <div class="navitem" data-tab="sudo">加入 sudoers</div>
     <div class="navitem" data-tab="ime">输入法</div>
+    <div class="navitem" data-tab="upgrade">升级修复</div>
   </div>
   <div class="main">
     <div class="privcard un" id="privCard">
@@ -1108,6 +1460,33 @@ tr:hover td{background:#fafbfc}
           <span class="spin" id="imeStatus"></span>
         </div>
         <div id="imeBox" style="margin-top:6px"></div>
+      </div>
+    </div>
+
+    <div id="tab-upgrade" style="display:none">
+      <div class="card">
+        <h2>修复「系统升级」按钮失效</h2>
+        <div class="hint" style="margin-bottom:12px">
+          <b>适用现象：</b>控制中心点「更新 / 升级」报错、没反应，或一直显示"已是最新"，
+          但 <code>apt list --upgradable</code> 实际能列出大量可升级包。<br>
+          <b>根因：</b>UOS 的升级由 <b>lastore</b> 守护进程驱动，它用的是<b>自己的源目录
+          <code>/var/lib/lastore/</code></b>，<b>不是</b> <code>/etc/apt</code>。
+          该目录下源配置缺失时，lastore 拉不到更新列表 → <code>UpdatablePackages=0</code> → 升级按钮失效。<br>
+          <b>修复内容：</b>① 从 <code>/etc/apt/sources.list.d</code> 同步源软链接；
+          ② 生成 lastore 的 <code>sources.list</code>（<b>源地址取自本机</b>，绝不照抄别的机器）；
+          ③ 修复 <code>config.json</code>（<code>UpdateMode=7</code>）；④ 重启 lastore 并触发刷新源。<br>
+          <b>安全：</b>只改 lastore 配置，<b>不执行 apt upgrade、不安装/卸载任何软件包</b>；改前自动备份 config.json。<br>
+          <b>权限：</b>修复需要 root（建议在连接里填 root 密码 / 提权方式选 su）。
+        </div>
+        <div class="row">
+          <button id="btnUpgDiag">仅诊断（只读）</button>
+          <button id="btnUpgFix" class="primary">一键修复升级</button>
+          <label style="display:flex;align-items:center;gap:6px;margin:0;font-size:12px;color:#57606a">
+            <input type="checkbox" id="upgForce" style="width:auto"> 忽略诊断结果，强制执行修复
+          </label>
+          <span class="spin" id="upgStatus"></span>
+        </div>
+        <div id="upgBox" style="margin-top:8px"></div>
       </div>
     </div>
 
@@ -1476,7 +1855,7 @@ document.querySelectorAll('.navitem[data-tab]').forEach(el => {
   el.onclick = () => {
     document.querySelectorAll('.navitem[data-tab]').forEach(x => x.classList.remove('active'));
     el.classList.add('active');
-    ['info','soft','install','sudo','ime'].forEach(t => $('tab-' + t).style.display = (t === el.dataset.tab ? '' : 'none'));
+    ['info','soft','install','sudo','ime','upgrade'].forEach(t => $('tab-' + t).style.display = (t === el.dataset.tab ? '' : 'none'));
   };
 });
 
@@ -1521,6 +1900,68 @@ $('btnAddSudo').onclick = async () => {
     log('加入 sudoers 失败');
   }
 };
+
+function upgTable(rows, withAfter){
+  if(!rows || !rows.length) return '';
+  let h = '<table><tr><th style="width:41%">检查项</th><th>修复前</th>' +
+    (withAfter ? '<th>修复后</th>' : '') + '</tr>';
+  rows.forEach(r => {
+    const key = (r[0] || '').indexOf('关键') >= 0;
+    let a = esc(r[1] || '-'), b = esc(r[2] || '-');
+    if(key && withAfter){
+      const n = parseInt((r[2] || '').trim(), 10);
+      const color = (!isNaN(n) && n > 0) ? '#16a34a' : '#dc2626';
+      b = '<b style="color:' + color + '">' + b + '</b>';
+    }
+    h += '<tr><td>' + esc(r[0] || '') + '</td><td>' + a + '</td>' +
+      (withAfter ? '<td>' + b + '</td>' : '') + '</tr>';
+  });
+  return h + '</table>';
+}
+
+async function upgRun(fix){
+  const c = curConn(); if(!c) return;
+  if(fix && !confirm('将修复「系统升级」按钮（lastore 升级组件）。\n\n' +
+      '操作内容：同步 lastore 源配置 + 修复 config.json(UpdateMode=7) + 重启 lastore。\n' +
+      '不会执行 apt upgrade，不会动任何软件包；config.json 会自动备份。\n' +
+      '需要 root 权限（root 密码 / su 提权）。\n\n确定继续吗？')) return;
+  const btn = fix ? $('btnUpgFix') : $('btnUpgDiag');
+  const label = fix ? '一键修复升级' : '仅诊断（只读）';
+  btn.disabled = true; btn.textContent = fix ? '修复中…' : '诊断中…';
+  $('btnUpgDiag').disabled = true; $('btnUpgFix').disabled = true;
+  $('upgStatus').textContent = ''; $('upgBox').innerHTML = '';
+  log((fix ? '开始修复系统升级' : '开始诊断系统升级') + ': ' + c.username + '@' + c.host);
+  let r = null;
+  try {
+    const tid = (await api('/api/fixupgrade', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({conn:c, fix:fix, force:($('upgForce') ? $('upgForce').checked : false)})})).task;
+    r = await poll(tid);
+  } catch(e){ log('请求失败: ' + e); }
+  $('btnUpgDiag').disabled = false; $('btnUpgFix').disabled = false;
+  btn.textContent = label;
+  if(!r){
+    $('upgBox').innerHTML = '<div class="hint" style="color:#dc2626">执行失败，详见日志</div>';
+    return;
+  }
+  const color = (r.verdict === 'healthy') ? '#16a34a' :
+                (r.verdict === 'fault' ? '#dc2626' : '#b45309');
+  let h = '';
+  if(r.error){
+    h += '<div class="hint" style="color:#dc2626;font-weight:500;white-space:pre-line;margin-bottom:8px">' +
+      esc(r.error) + '</div>';
+  }
+  h += upgTable(r.rows, !r.diagnosed);
+  if(r.msg){
+    h += '<div class="hint" style="color:' + color + ';font-weight:500;white-space:pre-line;margin-top:8px">' +
+      esc(r.msg) + '</div>';
+  }
+  $('upgBox').innerHTML = h;
+  log((fix ? '升级修复' : '升级诊断') + (r.verdict === 'healthy' ? '：正常' :
+      (r.verdict === 'fault' ? '：发现故障' : '：待观察')));
+}
+
+$('btnUpgDiag').onclick = () => upgRun(false);
+$('btnUpgFix').onclick = () => upgRun(true);
 
 loadConns().then(() => { if(conns.length){ cur = 0; renderConns(); setStatus('已选择 ' + conns[0].name, 'on'); } });
 </script>
@@ -1619,6 +2060,14 @@ class Handler(BaseHTTPRequestHandler):
                 tid = new_task()
                 run_async(tid, lambda t: action_addime(
                     t, data["conn"], bool(data.get("set_default", True))))
+                self._json({"task": tid})
+
+            elif p == "/api/fixupgrade":
+                data = json.loads(self._body().decode("utf-8"))
+                tid = new_task()
+                fix = bool(data.get("fix", True))
+                force = bool(data.get("force", False))
+                run_async(tid, lambda t: action_fixupgrade(t, data["conn"], fix, force))
                 self._json({"task": tid})
 
             elif p == "/api/sysinfo":
