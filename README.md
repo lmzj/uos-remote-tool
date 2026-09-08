@@ -4,13 +4,17 @@
 
 典型场景：管理信创终端（UOS、Deepin、麒麟等），远程装软件、查硬件、修输入法，不用跑到工位前。
 
+**当前版本：v1.0.1**
+
+> 可执行文件统一发布在 [Releases](https://github.com/lmzj/uos-remote-tool/releases) 页面，仓库本身不存放 exe。
+
 ---
 
 ## 功能
 
 | 模块 | 说明 |
 | --- | --- |
-| **连接管理** | 保存主机 / 账号 / 密码 / root 密码，支持多个连接切换，一键测试连通性 |
+| **连接管理** | 保存主机 / 账号 / 密码 / root 密码，多个连接切换，一键测试连通性，**已保存的连接可直接编辑** |
 | **系统信息** | CPU、内存、内核、主机名、产品型号、主板序列号、硬盘序列号、网卡 MAC / IP / 速率、分区使用，支持导出 JSON |
 | **软件管理** | 读取已安装软件列表、关键词模糊搜索、卸载（remove / purge），带系统关键包黑名单保护 |
 | **上传安装** | 本地选 `.deb` 等包 → SFTP 传到远程 → `dpkg -i` 安装，带进度条 |
@@ -23,11 +27,12 @@
 
 ### 直接用（Windows）
 
-到 [Releases](https://github.com/lmzj/uos-remote-tool/releases) 下载 `UOSRemoteTool.exe`（约 19 MB），双击运行。
+到 [Releases](https://github.com/lmzj/uos-remote-tool/releases) 下载最新版 `UOSRemoteTool.exe`（约 19 MB），双击运行。
 
 - 会弹出一个原生窗口（内嵌 Web 界面），**关掉窗口即停止服务**
 - 界面实际访问 `http://127.0.0.1:8765`，仅监听本机，外部不可访问
-- 需要旧版本 / 历史构建可在 [Releases 列表](https://github.com/lmzj/uos-remote-tool/releases) 里找
+- 历史版本可在 [Releases 列表](https://github.com/lmzj/uos-remote-tool/releases) 里找
+- GUI 模式下控制台输出会写入程序同目录的 `uostool.log`，排错时看它
 
 ### 从源码运行
 
@@ -120,8 +125,26 @@ SSH 连续失败会触发账户锁定，需在目标机执行 `faillock --user <
 uos_remote_tool.py      # 主程序（后端 + 内嵌前端页面，单文件）
 UOSRemoteTool.spec      # PyInstaller 打包配置
 connections.json        # 连接配置（明文，运行后生成，已 gitignore）
+uostool.log             # GUI 模式运行日志（已 gitignore）
 _uploads/               # 上传文件暂存目录
 ```
+
+---
+
+## 更新日志
+
+### v1.0.1
+
+- 连接列表新增「✎ 编辑」入口，已保存的连接可直接修改（老配置缺字段时自动兜底）
+- 界面标题显示当前版本号
+- 保存连接后重置提权状态，提示重新「检测提权」，避免沿用失效结果
+- 删除正在选中的连接时同步取消选中
+- 连接名过长时正常换行，不再挤掉操作按钮
+- GUI（无控制台）模式下把 stdout / stderr 重定向到 `uostool.log`，便于排查启动崩溃
+
+### v1.0.0
+
+- 首个可用版本：连接管理、系统信息、软件管理、上传安装、加入 sudoers、输入法修复
 
 ---
 

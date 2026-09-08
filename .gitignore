@@ -1,21 +1,31 @@
-# 连接配置（含明文密码，切勿提交）
+# ⚠️ 连接配置含明文密码（含 root 密码），绝不可提交
 connections.json
-connections*.json
 
-# 上传暂存
-_uploads/
-
-# PyInstaller 构建中间产物
+# 打包产物
 build/
 dist/
-*.spec.bak
+*.exe
+*.pkg
+
+# 上传缓存（可能是私有 deb 包）
+_uploads/
+
+# 运行日志（含本地路径，无提交价值）
+uostool.log
+
+# 工作区私有数据
+.workbuddy/
 
 # Python
 __pycache__/
 *.py[cod]
+*.egg-info/
 .venv/
 venv/
+env/
 
-# 系统
+# 编辑器 / 系统
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db

@@ -10,6 +10,8 @@ UOS 远程助手 —— 远程 Debian/UOS 主机管理工具
   * 本地 Web 界面, 仅监听 127.0.0.1
 """
 
+VERSION = "1.0.1"
+
 import os
 import sys
 import io
@@ -939,7 +941,11 @@ label{font-size:12px;color:#57606a;display:block;margin-bottom:4px}
  display:flex;justify-content:space-between;align-items:center;gap:6px}
 .conn:hover{background:#f3f4f6}
 .conn.active{background:#ddf4ff}
-.conn .del{color:#cf222e;font-size:12px;padding:0 4px}
+.conn .cname{flex:1;min-width:0;word-break:break-all}
+.conn .acts{display:flex;gap:7px;align-items:center;flex-shrink:0}
+.conn .edit{color:#0969da;font-size:14px;padding:0 3px;line-height:1}
+.conn .edit:hover{background:#ddf4ff;border-radius:3px}
+.conn .del{color:#cf222e;font-size:12px;padding:0 3px}
 .navitem{padding:8px 10px;border-radius:6px;cursor:pointer;font-size:13px;color:#1f2328}
 .navitem:hover{background:#f3f4f6}
 .navitem.active{background:#f0f3f6;font-weight:500}
@@ -1002,7 +1008,7 @@ tr:hover td{background:#fafbfc}
 </head>
 <body>
 <div class="top">
-  <h1>UOS 远程助手</h1>
+  <h1>UOS 远程助手 <span style="font-size:12px;color:#57606a;font-weight:400">v__VERSION__</span></h1>
   <div class="status"><span class="dot" id="dot"></span><span id="statusText">未连接</span></div>
 </div>
 <div class="wrap">
@@ -1147,16 +1153,27 @@ function renderConns(){
   if(!conns.length){ box.innerHTML = '<div class="empty" style="padding:8px">暂无连接</div>'; return; }
   box.innerHTML = conns.map((c,i) =>
     '<div class="conn' + (i===cur?' active':'') + '" data-i="' + i + '">' +
-      '<span>' + esc(c.name) + '<br><span style="font-size:11px;color:#57606a">' + esc(c.username) + '@' + esc(c.host) + '</span></span>' +
-      '<span class="del" data-del="' + i + '">×</span>' +
+      '<span class="cname">' + esc(c.name) + '<br><span style="font-size:11px;color:#57606a">' + esc(c.username) + '@' + esc(c.host) + '</span></span>' +
+      '<span class="acts">' +
+        '<span class="edit" data-edit="' + i + '" title="编辑此连接">✎</span>' +
+        '<span class="del" data-del="' + i + '" title="删除此连接">×</span>' +
+      '</span>' +
     '</div>').join('');
   box.querySelectorAll('.conn').forEach(el => {
     el.onclick = e => {
       if(e.target.dataset.del !== undefined){
         const i = +e.target.dataset.del;
         if(confirm('删除连接 ' + conns[i].name + ' ?')){
-          api('/api/conns?idx=' + i, {method:'DELETE'}).then(loadConns);
+          api('/api/conns?idx=' + i, {method:'DELETE'}).then(() => {
+            if(cur === i) cur = -1;
+            loadConns();
+          });
         }
+        return;
+      }
+      if(e.target.dataset.edit !== undefined){
+        e.stopPropagation();
+        connForm(+e.target.dataset.edit);
         return;
       }
       cur = +el.dataset.i; renderConns(); setStatus('已选择 ' + conns[cur].name, 'on');
@@ -1192,7 +1209,12 @@ function privOptions(sel){
 }
 
 function connForm(idx){
-  const c = idx >= 0 ? conns[idx] : {name:'',host:'',port:22,username:'',password:'',root_password:'',privilege:'auto'};
+  // 用默认值兜底：老配置可能没有 privilege / root_password 等字段
+  const src = (idx >= 0 && conns[idx]) ? conns[idx] : {};
+  const c = Object.assign(
+    {name:'',host:'',port:22,username:'',password:'',root_password:'',privilege:'auto'},
+    src);
+  if(!c.privilege) c.privilege = 'auto';
   const isNew = idx < 0;
   $('modal').innerHTML =
     '<div class="modal"><div class="box">' +
@@ -1244,6 +1266,8 @@ function connForm(idx){
     await loadConns();
     cur = idx >= 0 ? idx : conns.length - 1;
     renderConns(); setStatus('已保存 ' + data.name, 'on');
+    // 密码/提权方式可能已改动，旧的检测结果失效，重置为未检测
+    setPriv('un', '配置已更新，请重新点击「检测提权」确认权限。');
     log('连接已保存: ' + data.name);
   };
   $('f_test').onclick = async () => {
@@ -1539,7 +1563,8 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         try:
             if p in ("/", "/index.html"):
-                self._send(200, PAGE, "text/html; charset=utf-8")
+                self._send(200, PAGE.replace("__VERSION__", VERSION),
+                           "text/html; charset=utf-8")
             elif p == "/api/conns":
                 self._json(load_conns())
             elif p == "/api/task":
@@ -1757,7 +1782,27 @@ def run_tk_window(url, srv):
     root.mainloop()
 
 
+def setup_no_console():
+    """打包成 GUI（console=False）时 sys.stdout 是 None，把输出重定向到日志文件便于排查。"""
+    if sys.stdout is not None and sys.stderr is not None:
+        return None
+    path = os.path.join(BASE, "uostool.log")
+    try:
+        f = open(path, "a", encoding="utf-8", buffering=1)
+        f.write("\n----- %s v%s -----\n" % (
+            time.strftime("%Y-%m-%d %H:%M:%S"), VERSION))
+    except Exception:
+        try:
+            f = open(os.devnull, "w")
+        except Exception:
+            return None
+    sys.stdout = f
+    sys.stderr = f
+    return path
+
+
 def main():
+    setup_no_console()
     srv, url = start_server()
     print("=" * 52)
     print("  UOS 远程助手已启动")
